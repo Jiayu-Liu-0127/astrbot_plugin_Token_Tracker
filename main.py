@@ -61,13 +61,13 @@ class TokenTracker(Star):
             return False
         
         data = self.stats[sid]
-        current_time = time.monotonic()
+        now = time.monotonic()  # 统一时间戳
         interval_seconds = self.auto_interval_hours * 60 * 60
         
         # 检查会话是否过期
         if "current" in data and data["current"]:
             start_time = data["current"].get("start_time", 0)
-            if current_time - start_time > self.session_ttl:
+            if now - start_time > self.session_ttl:
                 # 会话过期，清理
                 del self.stats[sid]
                 return False
@@ -78,9 +78,9 @@ class TokenTracker(Star):
         
         if last_token_time is None:
             # 从未使用过/token，从会话创建时间开始计算
-            if session_start > 0 and current_time - session_start >= interval_seconds:
+            if session_start > 0 and now - session_start >= interval_seconds:
                 return True
-        elif current_time - last_token_time >= interval_seconds:
+        elif now - last_token_time >= interval_seconds:
             return True
         
         return False
@@ -97,11 +97,12 @@ class TokenTracker(Star):
         # 计算距离上次统计的时间
         last_token_time = self.stats[sid].get("last_token_time")
         session_start = self.stats[sid].get("session_start", 0)
+        now = time.monotonic()  # 统一时间戳
         
         if last_token_time is None:
-            elapsed_hours = (time.monotonic() - session_start) / 3600
+            elapsed_hours = (now - session_start) / 3600
         else:
-            elapsed_hours = (time.monotonic() - last_token_time) / 3600
+            elapsed_hours = (now - last_token_time) / 3600
         
         # 生成自动统计信息
         auto_msg = f"""⏰ 定时Token统计（已{elapsed_hours:.1f}小时未查看）：
@@ -115,19 +116,20 @@ class TokenTracker(Star):
         # 重置当前统计
         self._init_session_stats(sid)
         # 更新最后统计时间
-        self.stats[sid]["last_token_time"] = time.monotonic()
+        self.stats[sid]["last_token_time"] = now
         # 清除待处理标志
         self.stats[sid]["pending_auto"] = False
         
         logger.info(f"自动统计执行: {sid}, 消耗={current_stats['total']}tokens, 间隔={elapsed_hours:.1f}小时")
         
-        # 发送自动统计消息
-        yield event.plain_result(auto_msg)
+        # 修复：使用event.send()而不是yield
+        await event.send(event.plain_result(auto_msg))
     
     @filter.on_llm_response()
     async def on_llm_response(self, event: AstrMessageEvent, resp: LLMResponse):
         try:
             sid = self._session_id(event)
+            now = time.monotonic()  # 统一时间戳
             
             # 检查是否需要自动统计
             if self._check_auto_token(sid):
@@ -146,10 +148,13 @@ class TokenTracker(Star):
                 
                 logger.debug(f"记录token: {sid}, 本次={usage.total_tokens}, 累计={stats['total']}")
             
+            # 清理过期会话
+            self._cleanup_expired_sessions()
+            
             # 如果有待处理的自动统计，执行它
+            # 修复：直接调用而不是async for循环
             if sid in self.stats and self.stats[sid].get("pending_auto", False):
-                async for msg in self._execute_auto_token(event, sid):
-                    yield msg
+                await self._execute_auto_token(event, sid)
                 
         except Exception as e:
             logger.error(f"处理LLM响应出错: {e}")
@@ -157,6 +162,9 @@ class TokenTracker(Star):
     @filter.command("token")
     async def show_token(self, event: AstrMessageEvent):
         """显示当前对话段的token统计"""
+        # 清理过期会话
+        self._cleanup_expired_sessions()
+        
         sid = self._session_id(event)
         
         # 更新最后手动统计时间
@@ -186,15 +194,17 @@ class TokenTracker(Star):
         
         yield event.plain_result(msg)
     
+
+    
     def _cleanup_expired_sessions(self):
         """清理过期会话"""
-        current_time = time.monotonic()
+        now = time.monotonic()  # 统一时间戳
         expired_sids = []
         
         for sid, data in self.stats.items():
             if "current" in data and data["current"]:
                 start_time = data["current"].get("start_time", 0)
-                if current_time - start_time > self.session_ttl:
+                if now - start_time > self.session_ttl:
                     expired_sids.append(sid)
         
         for sid in expired_sids:
