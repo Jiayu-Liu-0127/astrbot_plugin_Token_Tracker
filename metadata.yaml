@@ -1,7 +1,7 @@
 name: astrbot_plugin_token_tracker
 version: 1.1.1
 author: Lystars
-description: 输入/token查看token统计，支持自动统计和配置界面设置间隔
+description: 输入/token以查看对话段token统计信息，支持自动统计、自动重置和自动清理
 entry: main.py
 dependencies: []
 events:

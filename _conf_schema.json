@@ -2,7 +2,7 @@
   "interval_hours": {
     "type": "float",
     "description": "自动统计间隔（小时）",
-    "hint": "超过此时间未使用/token，AI回复后会自动输出统计信息",
+    "hint": "超过此时间未使用/token，下一次AI回复后会自动输出统计信息",
     "default": 24.0,
     "slider": {
       "min": 1,

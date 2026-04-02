@@ -7,7 +7,7 @@ from astrbot.api import logger, AstrBotConfig
 from astrbot.core.provider.entites import LLMResponse
 
 @register("token_tracker", "Lystars", 
-          "输入/token查看token统计，支持自动统计和配置界面设置间隔", 
+          "输入/token以查看对话段token统计信息，支持自动统计、自动重置和自动清理", 
           "1.1.1")
 class TokenTracker(Star):
     def __init__(self, context: Context, config: AstrBotConfig):

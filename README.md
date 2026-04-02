@@ -31,7 +31,7 @@ git clone https://github.com/Jiayu-Liu-0127/astrbot_plugin_token_tracker
 3. 点击"设置"或"配置"
 4. 可配置以下选项：
 
-   - **自动统计间隔（小时）**：超过此时间未使用`/token`，AI回复后会自动输出统计信息
+   - **自动统计间隔（小时）**：超过此时间未使用`/token`，下一次AI回复后会自动输出统计信息
      - 范围：1-720小时（1小时到30天）
      - 默认：24小时
      - 支持滑块调整
@@ -97,7 +97,7 @@ config_schema:
     interval_hours:
       type: number
       title: 自动统计间隔（小时）
-      description: 超过此时间未使用/token，AI回复后会自动输出统计信息
+      description: 超过此时间未使用/token，下一次AI回复后会自动输出统计信息
       default: 24
       minimum: 1
       maximum: 720
