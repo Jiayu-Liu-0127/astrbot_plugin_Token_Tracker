@@ -1,7 +1,7 @@
-name: token_tracker
+name: astrbot_plugin_token_tracker
 version: 1.0.0
 author: Lystars
-description: 输入/token以查看当前对话段token统计信息，每次查看后自动重置
+description: 实时跟踪对话中的token消耗，输入/token以查看当前对话段token统计信息，每次查看后自动重置
 entry: token_tracker.py
 dependencies: []
 events:
@@ -11,3 +11,4 @@ config_schema: {}
 permissions:
   - read
   - write
+repo: https://github.com/Jiayu-Liu-0127/astrbot_plugin_token_tracker
