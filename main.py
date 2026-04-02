@@ -53,6 +53,11 @@ class TokenTracker(Star):
         # 清理性能优化：设置清理间隔（秒）
         self.cleanup_interval = 300  # 5分钟清理一次
         self.last_cleanup_time = time.monotonic()
+
+        # 时间基准管理：内存使用 monotonic，用于运行时间隔判断；持久化转为 wall-clock
+        self._base_wall_time = time.time()
+        self._base_mono = time.monotonic()
+
         # 持久化配置
         self.persist_enabled = True
         self.persist_interval = 300  # 默认5分钟持久化一次
@@ -104,6 +109,12 @@ class TokenTracker(Star):
             raise ValueError(f"配置项 '{key}' 的值 {float_value} 超出范围 [{min_val}, {max_val}]")
 
         return float_value
+
+    def _wall_to_mono(self, wall_ts: float) -> float:
+        return self._base_mono + (wall_ts - self._base_wall_time)
+
+    def _mono_to_wall(self, mono_ts: float) -> float:
+        return self._base_wall_time + (mono_ts - self._base_mono)
 
     def _load_stats(self) -> None:
         """从持久化文件读取先前的会话统计，含细粒度容错"""
@@ -160,19 +171,34 @@ class TokenTracker(Star):
                         try:
                             session_start = float(session_start)
                         except (ValueError, TypeError):
-                            session_start = time.time()
+                            session_start = time.monotonic()
                     else:
-                        session_start = time.time()
+                        session_start = time.monotonic()
                     
                     last_active_time = data.get('last_active_time')
                     if last_active_time is not None:
                         try:
                             last_active_time = float(last_active_time)
                         except (ValueError, TypeError):
-                            last_active_time = time.time()
+                            last_active_time = time.monotonic()
                     else:
-                        last_active_time = time.time()
+                        last_active_time = time.monotonic()
                     
+                    if session_start is not None:
+                        session_start = self._wall_to_mono(session_start)
+                    if last_active_time is not None:
+                        last_active_time = self._wall_to_mono(last_active_time)
+                    if last_token_time is not None:
+                        last_token_time = self._wall_to_mono(last_token_time)
+                    if current is not None and isinstance(current, dict):
+                        current = dict(current)
+                        current_start = current.get('start_time')
+                        if current_start is not None:
+                            try:
+                                current['start_time'] = self._wall_to_mono(float(current_start))
+                            except (TypeError, ValueError):
+                                current['start_time'] = self._base_mono
+
                     self.stats[sid] = {
                         'current': current,
                         'last_token_time': last_token_time,
@@ -197,9 +223,31 @@ class TokenTracker(Star):
             return
 
         try:
+            # 为持久化构造可序列化、wall-clock 时间戳数据
+            serialized = {}
+            for sid, data in self.stats.items():
+                current = data.get('current')
+                if current is not None and isinstance(current, dict):
+                    current_serial = dict(current)
+                    current_start = current_serial.get('start_time')
+                    if isinstance(current_start, (int, float)):
+                        current_serial['start_time'] = self._mono_to_wall(current_start)
+                    else:
+                        current_serial['start_time'] = None
+                else:
+                    current_serial = None
+
+                serialized[sid] = {
+                    'current': current_serial,
+                    'last_token_time': self._mono_to_wall(data['last_token_time']) if data.get('last_token_time') is not None else None,
+                    'session_start': self._mono_to_wall(data['session_start']) if data.get('session_start') is not None else None,
+                    'last_active_time': self._mono_to_wall(data['last_active_time']) if data.get('last_active_time') is not None else None,
+                    'pending_auto': bool(data.get('pending_auto', False))
+                }
+
             tmp_path = self._stats_file.with_suffix('.json.tmp')
             with open(tmp_path, 'w', encoding='utf-8') as f:
-                json.dump(self.stats, f, ensure_ascii=False, indent=2)
+                json.dump(serialized, f, ensure_ascii=False, indent=2)
             tmp_path.replace(self._stats_file)
         except Exception as e:
             logger.warning(f"持久化会话数据失败: {e}")
@@ -262,8 +310,8 @@ class TokenTracker(Star):
         return lock
     
     def _create_default_session_data(self) -> SessionData:
-        """创建并返回默认会话数据对象（使用 wall-clock 时间戳以支持持久化）"""
-        now = time.time()
+        """创建并返回默认会话数据对象（使用 monotonic 时间戳，持久化时转换）"""
+        now = time.monotonic()
         return SessionData(
             current=None,
             last_token_time=None,
@@ -283,7 +331,7 @@ class TokenTracker(Star):
             "completion": 0,
             "total": 0,
             "count": 0,
-            "start_time": time.time()
+            "start_time": time.monotonic()
         }
         self.stats[sid]["current"] = current_stats
         return current_stats
@@ -304,9 +352,9 @@ class TokenTracker(Star):
         return current
     
     def _check_auto_token(self, sid: str) -> bool:
-        """检查是否需要自动统计 - 纯检查函数，无副作用（使用 wall-clock 时间）"""
+        """检查是否需要自动统计 - 纯检查函数，无副作用（使用 monotonic 时间）"""
         interval_seconds = self.auto_interval_hours * 60 * 60
-        now = time.time()
+        now = time.monotonic()
         
         if sid not in self.stats:
             return False
@@ -330,32 +378,39 @@ class TokenTracker(Star):
     
     async def _execute_auto_token(self, event: AstrMessageEvent, sid: str):
         """执行自动统计并发送消息 - 双检模式以避免锁竞争"""
-        now = time.time()
-        
-        # 首次检查（在锁内完成）
-        if sid not in self.stats:
-            return
-        
-        stats_data = self.stats[sid]
-        current_stats = stats_data["current"]
-        if current_stats is None or current_stats["count"] == 0:
-            # 没有统计记录时更新状态
+        # 先在锁内检查并“领取”自动统计任务，避免多次重复发送
+        lock = self._get_session_lock(sid)
+        async with lock:
+            if sid not in self.stats:
+                return
+
+            stats_data = self.stats[sid]
+            if not stats_data.get("pending_auto", False):
+                return
+
+            if not self._check_auto_token(sid):
+                stats_data["pending_auto"] = False
+                return
+
+            current_stats = stats_data["current"]
+            if current_stats is None or current_stats["count"] == 0:
+                stats_data["pending_auto"] = False
+                stats_data["last_token_time"] = time.monotonic()
+                stats_data["last_active_time"] = time.monotonic()
+                return
+
+            # 计算统计信息快照，并标记已领取（防重入）
+            stats_copy = dict(current_stats)
+            last_token_time = stats_data["last_token_time"]
+            session_start = stats_data["session_start"]
+            now = time.monotonic()
             stats_data["pending_auto"] = False
-            stats_data["last_token_time"] = now
-            stats_data["last_active_time"] = now
-            return
-        
-        # 保存当前统计数据的副本，避免后续调用中被修改
-        stats_copy = dict(current_stats)
-        last_token_time = stats_data["last_token_time"]
-        session_start = stats_data["session_start"]
-        
+
         if last_token_time is None:
             elapsed_hours = (now - session_start) / 3600
         else:
             elapsed_hours = (now - last_token_time) / 3600
-        
-        # 生成自动统计信息
+
         auto_msg = f"""⏰ 定时Token统计（已{elapsed_hours:.1f}小时未查看）：
 • 请求次数：{stats_copy['count']}次
 • 输入Token：{stats_copy['prompt']}个
@@ -363,29 +418,26 @@ class TokenTracker(Star):
 • 总计Token：{stats_copy['total']}个
 
 （统计已重置，下一轮定时统计将在{self.auto_interval_hours}小时后进行）"""
-        
+
         try:
-            # 先发送消息（锁已释放）
+            # 发送消息（不持锁）
             await event.send(event.plain_result(auto_msg))
-            
-            # 发送成功后再次加锁做最终状态确认/提交（双检模式）
+
+            # 发送成功后，再次加锁更新会话状态
             lock = self._get_session_lock(sid)
             async with lock:
                 if sid in self.stats:
                     self._init_session_stats(sid)
-                    self.stats[sid]["last_token_time"] = now
-                    self.stats[sid]["last_active_time"] = now
-                    self.stats[sid]["pending_auto"] = False
-                    
+                    self.stats[sid]["last_token_time"] = time.monotonic()
+                    self.stats[sid]["last_active_time"] = time.monotonic()
                     logger.info(f"自动统计执行成功: {sid}, 消耗={stats_copy['total']}tokens, 间隔={elapsed_hours:.1f}小时")
-            
+
         except Exception as send_error:
-            # 发送失败，保留统计数据
             logger.error(f"自动统计发送失败（统计保留）: {sid}, 错误: {send_error}")
             lock = self._get_session_lock(sid)
             async with lock:
                 if sid in self.stats:
-                    self.stats[sid]["last_active_time"] = now
+                    self.stats[sid]["last_active_time"] = time.monotonic()
     
     @filter.on_llm_response()
     async def on_llm_response(self, event: AstrMessageEvent, resp: LLMResponse):
@@ -394,7 +446,7 @@ class TokenTracker(Star):
         
         async with lock:
             try:
-                now = time.time()  # 统一时间戳
+                now = time.monotonic()  # 统一时间戳
                 
                 # 确保会话已初始化
                 self._ensure_session_initialized(sid)
@@ -404,9 +456,8 @@ class TokenTracker(Star):
                 
                 # 检查是否需要自动统计（在记录新token之前检查）
                 should_auto = self._check_auto_token(sid)
-                if should_auto:
-                    # 标记为待处理，将在本次回复后执行
-                    self.stats[sid]["pending_auto"] = True
+                # 最新状态机：每次响应都明确设pending状态，避免旧flag误报
+                self.stats[sid]["pending_auto"] = should_auto
                 
                 # 记录token使用（带空值保护）
                 usage = resp.raw_completion.usage if resp.raw_completion else None
@@ -467,7 +518,7 @@ class TokenTracker(Star):
                 # 性能优化：按间隔清理过期会话
                 self._cleanup_expired_sessions()
                 
-                now = time.time()  # 使用 wall-clock 时间戳以保持一致性
+                now = time.monotonic()  # 使用 monotonic 时间戳，避免系统时间跳变影响
                 
                 # 确保会话已初始化
                 self._ensure_session_initialized(sid)
@@ -520,12 +571,11 @@ class TokenTracker(Star):
         self.on_unload()
 
     def _cleanup_expired_sessions(self) -> int:
-        """清理过期会话 - 基于最后活跃时间，带性能优化（使用 wall-clock 时间）"""
-        now = time.time()  # wall-clock 时间戳用于会话过期判断
+        """清理过期会话 - 基于最后活跃时间，带性能优化（使用 monotonic 时间）"""
+        now = time.monotonic()
         
-        # 性能优化：检查是否需要清理（使用 monotonic 判断周期）
-        now_monotonic = time.monotonic()
-        if now_monotonic - self.last_cleanup_time < self.cleanup_interval:
+        # 性能优化：检查是否需要清理
+        if now - self.last_cleanup_time < self.cleanup_interval:
             return 0  # 未到清理间隔
         
         self.last_cleanup_time = now_monotonic
