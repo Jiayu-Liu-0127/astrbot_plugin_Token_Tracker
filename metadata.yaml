@@ -1,0 +1,13 @@
+name: token_tracker
+version: 1.0.0
+author: Lystars
+description: 输入/token以查看当前对话段token统计信息，每次查看后自动重置
+entry: token_tracker.py
+dependencies: []
+events:
+  - on_llm_response
+  - command
+config_schema: {}
+permissions:
+  - read
+  - write
