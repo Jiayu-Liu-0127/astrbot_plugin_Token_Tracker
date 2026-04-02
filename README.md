@@ -5,5 +5,13 @@
 
 ## 安装方法：
 * 直接在astrbot插件市场搜索插件名后自动安装
+* 如安装失败，可尝试克隆源码：
+```bash
+# 克隆仓库到插件目录
+cd /AstrBot/data/plugins
+git clone https://github.com/Jiayu-Liu-0127/astrbot_plugin_token_tracker
+
+# 控制台重启AstrBot
+```
 ## 触发词：
 /token
