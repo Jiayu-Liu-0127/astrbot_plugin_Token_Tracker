@@ -1,9 +1,11 @@
+import os
+import json
 import time
 import traceback
 import asyncio
 from typing import Dict, TypedDict, Optional
 from astrbot.api.event import AstrMessageEvent, filter
-from astrbot.api.star import Context, Star, register
+from astrbot.api.star import Context, Star, register, StarTools
 from astrbot.api import logger, AstrBotConfig
 from astrbot.core.provider.entities import LLMResponse
 
@@ -34,43 +36,132 @@ class TokenTracker(Star):
         self._session_locks: Dict[str, asyncio.Lock] = {}
         
         # 安全解析配置，带容错处理
+        self.auto_interval_hours = 24.0
+        self.session_ttl = 72.0 * 60 * 60
+
         try:
             self.auto_interval_hours = self._safe_get_config_float(config, "interval_hours", 24.0, 1.0, 720.0)
         except ValueError as e:
             logger.error(f"配置解析失败: {e}，使用默认值24.0小时")
-            self.auto_interval_hours = 24.0
-        
+
         try:
             session_ttl_hours = self._safe_get_config_float(config, "session_ttl_hours", 72.0, 1.0, 720.0)
             self.session_ttl = session_ttl_hours * 60 * 60  # 转换为秒
         except ValueError as e:
             logger.error(f"配置解析失败: {e}，使用默认值72.0小时")
-            self.session_ttl = 72.0 * 60 * 60
         
         # 清理性能优化：设置清理间隔（秒）
         self.cleanup_interval = 300  # 5分钟清理一次
         self.last_cleanup_time = time.monotonic()
-        
+        # 持久化配置
+        self.persist_enabled = True
+        self.persist_interval = 300  # 默认5分钟持久化一次
+        self.last_persist_time = time.monotonic()
+        self._pending_cleanup_sids = set()
+
+        try:
+            persist_enabled_raw = config.get("persist_enabled", True)
+            if isinstance(persist_enabled_raw, str):
+                lower_val = persist_enabled_raw.strip().lower()
+                self.persist_enabled = lower_val in ("1", "true", "yes", "on")
+            else:
+                self.persist_enabled = bool(persist_enabled_raw)
+        except Exception:
+            self.persist_enabled = True
+
+        try:
+            persist_minutes = self._safe_get_config_float(config, "persist_interval_minutes", 5.0, 1.0, 60.0)
+            self.persist_interval = int(persist_minutes * 60)
+        except ValueError as e:
+            logger.error(f"持久化间隔配置解析失败: {e}，使用默认5分钟")
+            self.persist_interval = 300
+
+        # 从 StarTools 读取标准数据目录，支持持久化还原
+        try:
+            data_dir = StarTools.get_data_dir()
+            os.makedirs(data_dir, exist_ok=True)
+            self._stats_file = os.path.join(data_dir, 'token_tracker_stats.json')
+        except Exception as e:
+            logger.error(f"无法获取数据目录，持久化功能禁用: {e}")
+            self._stats_file = None
+
+        self._load_stats()
+
         logger.info(f"TokenTracker插件已加载，自动统计间隔: {self.auto_interval_hours}小时，会话过期时间: {self.session_ttl/3600:.1f}小时")
     
     def _safe_get_config_float(self, config: AstrBotConfig, key: str, default: float, min_val: float, max_val: float) -> float:
         """安全获取配置浮点数，带范围验证"""
+        value = config.get(key, default)
+        if value is None:
+            return default
+
         try:
-            value = config.get(key, default)
-            if value is None:
-                return default
-            
-            # 转换为浮点数
             float_value = float(value)
-            
-            # 验证范围
-            if not (min_val <= float_value <= max_val):
-                raise ValueError(f"配置项 '{key}' 的值 {float_value} 超出范围 [{min_val}, {max_val}]")
-            
-            return float_value
         except (ValueError, TypeError) as e:
             raise ValueError(f"配置项 '{key}' 解析失败: {e}")
-    
+
+        if not (min_val <= float_value <= max_val):
+            raise ValueError(f"配置项 '{key}' 的值 {float_value} 超出范围 [{min_val}, {max_val}]")
+
+        return float_value
+
+    def _load_stats(self) -> None:
+        """从持久化文件读取先前的会话统计"""
+        if not self.persist_enabled or not self._stats_file:
+            return
+
+        try:
+            if not os.path.exists(self._stats_file):
+                return
+
+            with open(self._stats_file, 'r', encoding='utf-8') as f:
+                raw = json.load(f)
+
+            if not isinstance(raw, dict):
+                return
+
+            # 仅在当前内存为空时加载
+            if self.stats:
+                return
+
+            for sid, data in raw.items():
+                if not isinstance(data, dict):
+                    continue
+                self.stats[sid] = {
+                    'current': data.get('current'),
+                    'last_token_time': float(data.get('last_token_time')) if data.get('last_token_time') is not None else None,
+                    'session_start': float(data.get('session_start')) if data.get('session_start') is not None else time.monotonic(),
+                    'last_active_time': float(data.get('last_active_time')) if data.get('last_active_time') is not None else time.monotonic(),
+                    'pending_auto': bool(data.get('pending_auto', False))
+                }
+
+            logger.info(f"TokenTracker已从持久化数据恢复{len(self.stats)}个会话")
+
+        except Exception as e:
+            logger.warning(f"加载持久化会话数据失败: {e}")
+
+    def _save_stats(self) -> None:
+        """将当前会话统计持久化到本地文件"""
+        if not self._stats_file:
+            return
+
+        try:
+            tmp_path = f"{self._stats_file}.tmp"
+            with open(tmp_path, 'w', encoding='utf-8') as f:
+                json.dump(self.stats, f, ensure_ascii=False, indent=2)
+            os.replace(tmp_path, self._stats_file)
+        except Exception as e:
+            logger.warning(f"持久化会话数据失败: {e}")
+
+    def _maybe_persist_data(self) -> None:
+        if not self.persist_enabled:
+            return
+
+        now = time.monotonic()
+        if now - self.last_persist_time >= self.persist_interval:
+            self._save_stats()
+            self.last_persist_time = now
+
     def _session_id(self, event: AstrMessageEvent) -> str:
         """生成稳定的会话ID，异常时使用降级策略"""
         try:
@@ -108,24 +199,33 @@ class TokenTracker(Star):
     def _get_session_lock(self, sid: str) -> asyncio.Lock:
         """获取或创建会话锁 - 带并发安全的原子操作"""
         # 注：由于dict.setdefault是原子的，这里是线程安全的
-        return self._session_locks.setdefault(sid, asyncio.Lock())
+        lock = self._session_locks.setdefault(sid, asyncio.Lock())
+        # 如果该锁先前属于过期会话并已经释放，则清理过期标记
+        if sid in self._pending_cleanup_sids and not lock.locked():
+            self._pending_cleanup_sids.discard(sid)
+        return lock
     
+    def _create_default_session_data(self) -> SessionData:
+        """创建并返回默认会话数据对象"""
+        now = time.monotonic()
+        return SessionData(
+            current=None,
+            last_token_time=None,
+            session_start=now,
+            last_active_time=now,
+            pending_auto=False
+        )
+
     def _init_session_stats(self, sid: str) -> SessionStats:
         """初始化或重置会话的当前统计"""
         if sid not in self.stats:
-            self.stats[sid] = SessionData(
-                current=None,
-                last_token_time=None,
-                session_start=time.monotonic(),
-                last_active_time=time.monotonic(),
-                pending_auto=False
-            )
-        
+            self.stats[sid] = self._create_default_session_data()
+
         # 重置当前统计字段，保持其他字段不变
         current_stats: SessionStats = {
-            "prompt": 0, 
-            "completion": 0, 
-            "total": 0, 
+            "prompt": 0,
+            "completion": 0,
+            "total": 0,
             "count": 0,
             "start_time": time.monotonic()
         }
@@ -135,13 +235,7 @@ class TokenTracker(Star):
     def _ensure_session_initialized(self, sid: str) -> None:
         """确保会话已初始化，但不重置统计"""
         if sid not in self.stats:
-            self.stats[sid] = SessionData(
-                current=None,
-                last_token_time=None,
-                session_start=time.monotonic(),
-                last_active_time=time.monotonic(),
-                pending_auto=False
-            )
+            self.stats[sid] = self._create_default_session_data()
     
     def _get_current_stats(self, sid: str) -> Optional[SessionStats]:
         """获取当前统计，如果不存在则初始化或返回None"""
@@ -287,7 +381,8 @@ class TokenTracker(Star):
                     except Exception as auto_error:
                         logger.error(f"自动统计执行失败: {sid}, 错误: {auto_error}")
                         # 自动统计失败不影响主流程
-                
+
+                self._maybe_persist_data()
             except (ValueError, TypeError, AttributeError) as e:
                 # 可恢复的结构异常
                 logger.warning(f"LLM响应处理遇到可恢复异常: {sid}, 错误: {e}, 堆栈: {traceback.format_exc(limit=3)}")
@@ -336,12 +431,25 @@ class TokenTracker(Star):
                     msg = "当前暂无Token消耗记录。继续对话以开始统计。"
                     logger.debug(f"查询空统计: {sid}")
                 
+                self._maybe_persist_data()
                 yield event.plain_result(msg)
                 
             except Exception as e:
                 logger.error(f"处理/token命令失败: {sid}, 错误: {e}, 堆栈摘要: {traceback.format_exc(limit=5)}")
                 yield event.plain_result("统计查询失败，请稍后重试。")
-    
+
+    def on_unload(self):
+        """插件卸载/停止时写盘当前会话统计，避免数据丢失"""
+        try:
+            self._save_stats()
+            logger.info("TokenTracker退出时已持久化会话统计数据")
+        except Exception as e:
+            logger.warning(f"TokenTracker退出持久化失败: {e}")
+
+    async def on_unload_async(self):
+        """兼容异步卸载回调"""
+        self.on_unload()
+
     def _cleanup_expired_sessions(self) -> int:
         """清理过期会话 - 基于最后活跃时间，带性能优化"""
         now = time.monotonic()  # 统一时间戳
@@ -360,12 +468,34 @@ class TokenTracker(Star):
             if now - last_active > self.session_ttl:
                 expired_sids.append(sid)
         
+        # 检查此前因锁被持有而延迟清理的过期会话锁
+        stale_to_clean = []
+        for sid in list(self._pending_cleanup_sids):
+            lock = self._session_locks.get(sid)
+            if lock is None or not lock.locked():
+                self._session_locks.pop(sid, None)
+                stale_to_clean.append(sid)
+                logger.debug(f"最终清理先前过期锁: {sid}")
+
+        for sid in stale_to_clean:
+            self._pending_cleanup_sids.discard(sid)
+
         # 清理过期会话及其关联的锁
         for sid in expired_sids:
             del self.stats[sid]
-            # 同时清理对应的锁，避免内存泄漏
-            if sid in self._session_locks:
-                del self._session_locks[sid]
+
+            lock = self._session_locks.get(sid)
+            if lock is not None:
+                if lock.locked():
+                    # 锁仍被持有时，缓存到待清理列表，稍后再尝试
+                    self._pending_cleanup_sids.add(sid)
+                    logger.debug(f"延迟删除正在被持有的过期锁: {sid}")
+                else:
+                    del self._session_locks[sid]
+                    self._pending_cleanup_sids.discard(sid)
+                    logger.debug(f"删除过期会话锁: {sid}")
+
             logger.debug(f"清理过期会话: {sid}")
-        
+
+        self._maybe_persist_data()
         return len(expired_sids)

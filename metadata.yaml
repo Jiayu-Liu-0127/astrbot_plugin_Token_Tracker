@@ -10,4 +10,9 @@ events:
 permissions:
   - read
   - write
+config:
+  - interval_hours
+  - session_ttl_hours
+  - persist_interval_minutes
+  - persist_enabled
 repo: https://github.com/Jiayu-Liu-0127/astrbot_plugin_Token_Tracker
