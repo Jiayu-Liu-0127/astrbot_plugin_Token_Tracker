@@ -31,7 +31,7 @@ class SessionData(TypedDict):
     session_start: float
     last_auto_time: float
     last_active_time: float
-    "输入/token以查看token统计信息，支持自动统计，自动管理和数据持久化", 
+    "输入/token以查看token统计信息，支持定时自动统计和数据持久化管理", 
     "1.2.0"
     "1.2.0"
 class TokenTracker(Star):
